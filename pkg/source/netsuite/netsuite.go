@@ -28,7 +28,11 @@ type NetSuiteSource struct {
 }
 
 type uriConfig struct {
+	// connString is the full ODBC connection string for password auth, or the
+	// credential-less base string when tba is set (UID/PWD are appended per
+	// connection by tbaConnector).
 	connString string
+	tba        *tbaCredentials
 }
 
 type odbcParam struct {
@@ -53,7 +57,7 @@ func (s *NetSuiteSource) Connect(ctx context.Context, rawURI string) error {
 		return fmt.Errorf("ODBC driver support is not available in this ingestr build; use a Linux or Windows build with the ODBC manager installed")
 	}
 
-	db, err := sql.Open("odbc", cfg.connString)
+	db, err := openConnection(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to open NetSuite ODBC connection: %w", err)
 	}
@@ -251,41 +255,65 @@ func parseURI(rawURI string) (uriConfig, error) {
 		return uriConfig{connString: connString}, nil
 	}
 
-	if dsn := values.Get("dsn"); dsn != "" {
-		connString, err := buildDSNConnectionString(parsed, values, dsn)
-		if err != nil {
-			return uriConfig{}, err
-		}
-		return uriConfig{connString: connString}, nil
-	}
+	dsn := values.Get("dsn")
+	accountID, roleID := resolveAccountAndRole(parsed, values, dsn)
 
-	connString, err = buildDriverConnectionString(parsed, values)
+	tba, err := extractTBACredentials(accountID, values)
 	if err != nil {
 		return uriConfig{}, err
 	}
-	return uriConfig{connString: connString}, nil
+
+	if dsn != "" {
+		connString := buildDSNConnectionString(parsed, values, dsn, accountID, roleID, tba)
+		return uriConfig{connString: connString, tba: tba}, nil
+	}
+
+	connString, err = buildDriverConnectionString(parsed, values, accountID, roleID, tba)
+	if err != nil {
+		return uriConfig{}, err
+	}
+	return uriConfig{connString: connString, tba: tba}, nil
 }
 
-func buildDSNConnectionString(parsed *url.URL, values url.Values, dsn string) (string, error) {
-	params := []odbcParam{{key: "DSN", value: dsn}}
-	params = appendCredentials(params, parsed, values)
-	customProperties, err := buildCustomProperties(parsed, values)
-	if err != nil {
-		return "", err
+// resolveAccountAndRole determines the effective account ID and role ID. Values
+// supplied on the URI win; otherwise, when a DSN is used, they are read from the
+// DSN's CustomProperties in the ODBC ini (so a configured DSN need not repeat
+// them on the URI).
+func resolveAccountAndRole(parsed *url.URL, values url.Values, dsn string) (string, string) {
+	accountID := accountIDFromURI(parsed, values)
+	roleID := values.Get("role_id")
+	if dsn != "" && (accountID == "" || roleID == "") {
+		props := dsnCustomProperties(dsn)
+		if accountID == "" {
+			accountID = props["AccountID"]
+		}
+		if roleID == "" {
+			roleID = props["RoleID"]
+		}
 	}
-	if customProperties != "" {
+	return accountID, roleID
+}
+
+func buildDSNConnectionString(parsed *url.URL, values url.Values, dsn, accountID, roleID string, tba *tbaCredentials) string {
+	params := []odbcParam{{key: "DSN", value: dsn}}
+	if tba == nil {
+		params = appendCredentials(params, parsed, values)
+	}
+	// Role is not required on the DSN path: a configured DSN already supplies
+	// AccountID/RoleID to the driver. We only emit CustomProperties when we have
+	// values to set (URI overrides or ini-resolved).
+	if customProperties := buildCustomProperties(accountID, roleID, values); customProperties != "" {
 		params = append(params, odbcParam{key: "CustomProperties", value: customProperties})
 	}
-	return formatODBCConnectionString(params), nil
+	return formatODBCConnectionString(params)
 }
 
-func buildDriverConnectionString(parsed *url.URL, values url.Values) (string, error) {
+func buildDriverConnectionString(parsed *url.URL, values url.Values, accountID, roleID string, tba *tbaCredentials) (string, error) {
 	driver := firstNonEmpty(values.Get("driver"), values.Get("driver_name"))
 	if driver == "" {
 		return "", fmt.Errorf("dsn, driver, or odbc_connect_string is required for netsuite SuiteAnalytics Connect over ODBC")
 	}
 
-	accountID := accountIDFromURI(parsed, values)
 	host := values.Get("host")
 	if host == "" && parsed.Hostname() != "" && strings.Contains(parsed.Hostname(), ".") {
 		host = parsed.Hostname()
@@ -314,13 +342,17 @@ func buildDriverConnectionString(parsed *url.URL, values url.Values) (string, er
 	if truststore := values.Get("truststore"); truststore != "" {
 		params = append(params, odbcParam{key: "Truststore", value: truststore})
 	}
-	params = appendCredentials(params, parsed, values)
-
-	customProperties, err := buildCustomProperties(parsed, values)
-	if err != nil {
-		return "", err
+	if tba == nil {
+		params = appendCredentials(params, parsed, values)
 	}
-	if customProperties != "" {
+
+	// On the DSN-less driver path there is no DSN to supply the role, so it must
+	// be provided when an account ID is present.
+	if accountID != "" && roleID == "" && !containsODBCProperty(values.Get("custom_properties"), "RoleID") {
+		return "", fmt.Errorf("role_id is required when account_id is provided for netsuite SuiteAnalytics Connect over ODBC")
+	}
+
+	if customProperties := buildCustomProperties(accountID, roleID, values); customProperties != "" {
 		params = append(params, odbcParam{key: "CustomProperties", value: customProperties})
 	}
 
@@ -345,15 +377,9 @@ func appendCredentials(params []odbcParam, parsed *url.URL, values url.Values) [
 	return params
 }
 
-func buildCustomProperties(parsed *url.URL, values url.Values) (string, error) {
+func buildCustomProperties(accountID, roleID string, values url.Values) string {
 	var properties []string
-	accountID := accountIDFromURI(parsed, values)
-	roleID := values.Get("role_id")
 	extra := strings.Trim(values.Get("custom_properties"), "; ")
-
-	if accountID != "" && roleID == "" && !containsODBCProperty(extra, "RoleID") {
-		return "", fmt.Errorf("role_id is required when account_id is provided for netsuite SuiteAnalytics Connect over ODBC")
-	}
 
 	if accountID != "" {
 		properties = append(properties, "AccountID="+accountID)
@@ -371,7 +397,7 @@ func buildCustomProperties(parsed *url.URL, values url.Values) (string, error) {
 		properties = append(properties, extra)
 	}
 
-	return strings.Join(properties, ";"), nil
+	return strings.Join(properties, ";")
 }
 
 func containsODBCProperty(properties, key string) bool {

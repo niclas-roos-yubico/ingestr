@@ -65,6 +65,186 @@ func TestParseURIErrors(t *testing.T) {
 	}
 }
 
+func TestTBATokenPassword(t *testing.T) {
+	// Known-answer test. The expected signature was computed independently with:
+	//   printf '%s' '1234567&ck&tid&abc123&1700000000' | \
+	//     openssl dgst -sha256 -hmac 'cs&ts' -binary | openssl base64
+	setTBAClock(t, "abc123", 1700000000)
+
+	creds := tbaCredentials{
+		accountID:      "1234567",
+		consumerKey:    "ck",
+		consumerSecret: "cs",
+		tokenID:        "tid",
+		tokenSecret:    "ts",
+	}
+
+	pw, err := creds.tokenPassword()
+	require.NoError(t, err)
+	assert.Equal(t, "1234567&ck&tid&abc123&1700000000&xblpoRO5sCUEbB0LmlwAMMjUZnl15wLPuzbOjch9dC4=&HMAC-SHA256", pw)
+}
+
+func TestParseURIWithTBAOverDriver(t *testing.T) {
+	cfg, err := parseURI("netsuite://123456_SB1?driver=NetSuite+ODBC+Drivers+64bit&role_id=57&consumer_key=ck&consumer_secret=cs&token_id=tid&token_secret=ts")
+	require.NoError(t, err)
+
+	require.NotNil(t, cfg.tba)
+	assert.Equal(t, tbaCredentials{
+		accountID:      "123456_SB1",
+		consumerKey:    "ck",
+		consumerSecret: "cs",
+		tokenID:        "tid",
+		tokenSecret:    "ts",
+	}, *cfg.tba)
+
+	// The base connection string carries everything except the credentials;
+	// UID=TBA and the per-connection token password are appended at connect time.
+	assert.Equal(t, "DRIVER={NetSuite ODBC Drivers 64bit};Host=123456-sb1.connect.api.netsuite.com;Port=1708;Encrypted=1;AllowSinglePacketLogout=1;SDSN=NetSuite2.com;CustomProperties={AccountID=123456_SB1;RoleID=57};", cfg.connString)
+	assert.NotContains(t, cfg.connString, "UID=")
+	assert.NotContains(t, cfg.connString, "PWD=")
+}
+
+func TestParseURIWithTBAOverDSN(t *testing.T) {
+	cfg, err := parseURI("netsuite://?dsn=NetSuite&account_id=123456&role_id=57&client_id=ck&client_secret=cs&token=tid&token_secret=ts")
+	require.NoError(t, err)
+
+	require.NotNil(t, cfg.tba)
+	assert.Equal(t, "DSN=NetSuite;CustomProperties={AccountID=123456;RoleID=57};", cfg.connString)
+}
+
+func TestParseURITBAResolvesAccountAndRoleFromDSN(t *testing.T) {
+	// DSN supplies AccountID/RoleID (as a configured odbc.ini would); the URI
+	// only carries the token values.
+	prev := dsnCustomProperties
+	dsnCustomProperties = func(dsn string) map[string]string {
+		require.Equal(t, "NetSuite", dsn)
+		return map[string]string{"AccountID": "123456", "RoleID": "57"}
+	}
+	t.Cleanup(func() { dsnCustomProperties = prev })
+
+	cfg, err := parseURI("netsuite://?dsn=NetSuite&consumer_key=ck&consumer_secret=cs&token_id=tid&token_secret=ts")
+	require.NoError(t, err)
+
+	require.NotNil(t, cfg.tba)
+	assert.Equal(t, "123456", cfg.tba.accountID)
+	assert.Equal(t, "DSN=NetSuite;CustomProperties={AccountID=123456;RoleID=57};", cfg.connString)
+}
+
+func TestParseURITBAURIOverridesDSN(t *testing.T) {
+	prev := dsnCustomProperties
+	dsnCustomProperties = func(string) map[string]string {
+		return map[string]string{"AccountID": "9999999", "RoleID": "3"}
+	}
+	t.Cleanup(func() { dsnCustomProperties = prev })
+
+	cfg, err := parseURI("netsuite://?dsn=NetSuite&account_id=123456&role_id=57&consumer_key=ck&consumer_secret=cs&token_id=tid&token_secret=ts")
+	require.NoError(t, err)
+	require.NotNil(t, cfg.tba)
+	assert.Equal(t, "123456", cfg.tba.accountID)
+	assert.Equal(t, "DSN=NetSuite;CustomProperties={AccountID=123456;RoleID=57};", cfg.connString)
+}
+
+func TestParseINICustomProperties(t *testing.T) {
+	ini := `[ODBC Data Sources]
+NetSuite=NetSuite ODBC Drivers 8.1
+
+[NetSuite]
+Driver=/opt/netsuite/odbcclient/lib64/ivoa27.so
+Host=123456.connect.api.netsuite.com
+CustomProperties=AccountID=123456;RoleID=57
+
+[Other]
+CustomProperties=AccountID=1;RoleID=2
+`
+	props := parseINICustomProperties(ini, "NetSuite")
+	assert.Equal(t, "123456", props["AccountID"])
+	assert.Equal(t, "57", props["RoleID"])
+
+	assert.Nil(t, parseINICustomProperties(ini, "Missing"))
+}
+
+func TestParseURITBAErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		uri  string
+	}{
+		{"missing token_secret", "netsuite://123456?driver=NetSuite&role_id=57&consumer_key=ck&consumer_secret=cs&token_id=tid"},
+		{"missing consumer_secret", "netsuite://123456?driver=NetSuite&role_id=57&consumer_key=ck&token_id=tid&token_secret=ts"},
+		{"missing account", "netsuite://?driver=NetSuite&host=example.connect.api.netsuite.com&role_id=57&consumer_key=ck&consumer_secret=cs&token_id=tid&token_secret=ts"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseURI(tt.uri)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestTBAConnectorRegeneratesPerConnection(t *testing.T) {
+	setTBAClockSeq(t)
+
+	rec := &recordingDriver{}
+	c := &tbaConnector{
+		drv:  rec,
+		base: "DSN=NetSuite;CustomProperties={AccountID=123456;RoleID=57};",
+		creds: tbaCredentials{
+			accountID:      "123456",
+			consumerKey:    "ck",
+			consumerSecret: "cs",
+			tokenID:        "tid",
+			tokenSecret:    "ts",
+		},
+	}
+
+	_, err := c.Connect(context.Background())
+	require.NoError(t, err)
+	_, err = c.Connect(context.Background())
+	require.NoError(t, err)
+
+	require.Len(t, rec.dsns, 2)
+	assert.Contains(t, rec.dsns[0], "DSN=NetSuite;")
+	assert.Contains(t, rec.dsns[0], "UID=TBA;PWD=123456&ck&tid&")
+	// A fresh nonce per physical connection produces a distinct token password,
+	// honouring NetSuite's single-use token password requirement.
+	assert.NotEqual(t, rec.dsns[0], rec.dsns[1])
+}
+
+// setTBAClock pins the nonce and timestamp used when computing a token password.
+func setTBAClock(t *testing.T, nonce string, timestamp int64) {
+	t.Helper()
+	prevNonce, prevTime := tbaNonceFunc, tbaTimeFunc
+	tbaNonceFunc = func() (string, error) { return nonce, nil }
+	tbaTimeFunc = func() int64 { return timestamp }
+	t.Cleanup(func() {
+		tbaNonceFunc, tbaTimeFunc = prevNonce, prevTime
+	})
+}
+
+// setTBAClockSeq makes each token password deterministic but distinct.
+func setTBAClockSeq(t *testing.T) {
+	t.Helper()
+	prevNonce, prevTime := tbaNonceFunc, tbaTimeFunc
+	var n int
+	tbaNonceFunc = func() (string, error) {
+		n++
+		return fmt.Sprintf("nonce%d", n), nil
+	}
+	tbaTimeFunc = func() int64 { return 1700000000 }
+	t.Cleanup(func() {
+		tbaNonceFunc, tbaTimeFunc = prevNonce, prevTime
+	})
+}
+
+type recordingDriver struct {
+	dsns []string
+}
+
+func (d *recordingDriver) Open(name string) (driver.Conn, error) {
+	d.dsns = append(d.dsns, name)
+	return &fakeConn{}, nil
+}
+
 func TestBuildSuiteAnalyticsQuery(t *testing.T) {
 	start := time.Date(2026, 1, 2, 3, 4, 5, 123456789, time.UTC)
 	end := time.Date(2026, 1, 3, 3, 4, 5, 987654321, time.UTC)
