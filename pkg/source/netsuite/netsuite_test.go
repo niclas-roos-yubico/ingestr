@@ -339,37 +339,101 @@ func TestNetSuiteSourceReadWithODBCDB(t *testing.T) {
 }
 
 func TestTableColumns(t *testing.T) {
+	// data_type codes: 93=TIMESTAMP, -5=BIGINT, 8=DOUBLE, -9=WVARCHAR, -10=CLOB.
+	// memo and custbody_notes have size 4000 (> the wrapper's 1024 bindable
+	// limit) so they land on the crashing chunked-fetch path (non-bindable);
+	// entityid is a small VARCHAR2 that binds normally.
 	newDB := func() *sql.DB {
 		return openNetSuiteTestDB(t, fakeQueryResult{
-			expectedQuery: "SELECT column_name, type_name FROM oa_columns WHERE table_name = 'transaction'",
-			columns:       []string{"column_name", "type_name"},
+			expectedQuery: "SELECT column_name, type_name, data_type, oa_precision FROM oa_columns WHERE table_name = 'transaction'",
+			columns:       []string{"column_name", "type_name", "data_type", "oa_precision"},
 			rows: [][]driver.Value{
-				{"trandate", "TIMESTAMP"},
-				{"id", "BIGINT"},
-				{"memo", "VARCHAR2"},
-				{"amount", "DOUBLE"},
-				{"custbody_notes", "CLOB"},
+				{"trandate", "TIMESTAMP", int64(93), int64(0)},
+				{"id", "BIGINT", int64(-5), int64(0)},
+				{"memo", "VARCHAR2", int64(-9), int64(4000)},
+				{"amount", "DOUBLE", int64(8), int64(0)},
+				{"custbody_notes", "CLOB", int64(-10), int64(4000)},
+				{"entityid", "VARCHAR2", int64(-9), int64(100)},
 			},
 		})
 	}
 
-	// Schema qualifier is stripped; non-CLOB columns are sorted first, with CLOB
-	// columns ordered last (the ODBC long-data-last requirement).
+	// keep (default): bindable columns first, non-bindable (wide/CLOB) last; each
+	// group sorted. Schema qualifier is stripped.
 	s := &NetSuiteSource{db: newDB()}
 	cols, err := s.tableColumns(context.Background(), "MyView.transaction", nil)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"amount", "id", "memo", "trandate", "custbody_notes"}, cols)
+	assert.Equal(t, []string{"amount", "entityid", "id", "trandate", "custbody_notes", "memo"}, cols)
 
 	// Excluded columns (case-insensitive) are dropped.
 	cols, err = s.tableColumns(context.Background(), "transaction", []string{"MEMO"})
 	require.NoError(t, err)
-	assert.Equal(t, []string{"amount", "id", "trandate", "custbody_notes"}, cols)
+	assert.Equal(t, []string{"amount", "entityid", "id", "trandate", "custbody_notes"}, cols)
 
-	// With excludeCLOBColumns, CLOB-typed columns are skipped entirely.
+	// Legacy excludeCLOBColumns skips CLOB-typed columns; the non-CLOB wide
+	// column (memo) still remains, which is why it is insufficient on its own.
 	sNoCLOB := &NetSuiteSource{db: newDB(), excludeCLOBColumns: true}
 	cols, err = sNoCLOB.tableColumns(context.Background(), "transaction", nil)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"amount", "id", "memo", "trandate"}, cols)
+	assert.Equal(t, []string{"amount", "entityid", "id", "trandate", "memo"}, cols)
+
+	// wide_text=exclude drops every non-bindable column (CLOB and wide VARCHAR2).
+	sExclude := &NetSuiteSource{db: newDB(), wideTextMode: wideTextExclude}
+	cols, err = sExclude.tableColumns(context.Background(), "transaction", nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"amount", "entityid", "id", "trandate"}, cols)
+
+	// wide_text=truncate SUBSTR-wraps non-bindable char columns to a bindable
+	// width, keeping the data while avoiding the chunked-fetch crash path.
+	sTrunc := &NetSuiteSource{db: newDB(), wideTextMode: wideTextTruncate, wideTextMaxChars: 1000}
+	cols, err = sTrunc.tableColumns(context.Background(), "transaction", nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"amount", "entityid", "id", "trandate",
+		"SUBSTR(custbody_notes, 1, 1000) AS custbody_notes",
+		"SUBSTR(memo, 1, 1000) AS memo",
+	}, cols)
+}
+
+// TestTableColumnsFallsBackToTypeNameWhenDataTypeMissing verifies that a catalog
+// without a usable data_type still classifies CLOBs as non-bindable.
+func TestTableColumnsFallsBackToTypeNameWhenDataTypeMissing(t *testing.T) {
+	db := openNetSuiteTestDB(t, fakeQueryResult{
+		expectedQuery: "SELECT column_name, type_name, data_type, oa_precision FROM oa_columns WHERE table_name = 'transaction'",
+		columns:       []string{"column_name", "type_name", "data_type", "oa_precision"},
+		rows: [][]driver.Value{
+			{"id", "BIGINT", nil, nil},
+			{"custbody_notes", "CLOB", nil, nil},
+		},
+	})
+	s := &NetSuiteSource{db: db, wideTextMode: wideTextExclude}
+	cols, err := s.tableColumns(context.Background(), "transaction", nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"id"}, cols)
+}
+
+func TestParseWideTextOptions(t *testing.T) {
+	cfg, err := parseURI("netsuite://?dsn=NetSuite&wide_text=truncate&wide_text_max_chars=500")
+	require.NoError(t, err)
+	assert.Equal(t, wideTextTruncate, cfg.wideTextMode)
+	assert.Equal(t, 500, cfg.wideTextMaxChars)
+
+	// Defaults: keep mode, default truncation width.
+	cfg, err = parseURI("netsuite://?dsn=NetSuite")
+	require.NoError(t, err)
+	assert.Equal(t, wideTextKeep, cfg.wideTextMode)
+	assert.Equal(t, defaultWideTextMaxChars, cfg.wideTextMaxChars)
+
+	// A width above the bindable limit is clamped so the column still binds.
+	cfg, err = parseURI("netsuite://?dsn=NetSuite&wide_text=truncate&wide_text_max_chars=4000")
+	require.NoError(t, err)
+	assert.Equal(t, bindableCharWidthLimit, cfg.wideTextMaxChars)
+
+	_, err = parseURI("netsuite://?dsn=NetSuite&wide_text=bogus")
+	require.Error(t, err)
+
+	_, err = parseURI("netsuite://?dsn=NetSuite&wide_text_max_chars=0")
+	require.Error(t, err)
 }
 
 func TestUnqualifyTableName(t *testing.T) {
