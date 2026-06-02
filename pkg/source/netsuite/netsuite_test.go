@@ -255,13 +255,27 @@ func TestBuildSuiteAnalyticsQuery(t *testing.T) {
 		IntervalEnd:    &end,
 	})
 
-	assert.Equal(t, "SELECT * FROM transaction WHERE lastmodifieddate >= TO_TIMESTAMP('2026-01-02 03:04:05.123456789', 'YYYY-MM-DD HH24:MI:SSxFF') AND lastmodifieddate < TO_TIMESTAMP('2026-01-03 03:04:05.987654321', 'YYYY-MM-DD HH24:MI:SSxFF') ORDER BY lastmodifieddate ASC", got)
+	assert.Equal(t, "SELECT * FROM transaction WHERE lastmodifieddate >= TO_TIMESTAMP('2026-01-02 03:04:05.123456789', 'YYYY-MM-DD HH24:MI:SSxFF') AND lastmodifieddate < TO_TIMESTAMP('2026-01-03 03:04:05.987654321', 'YYYY-MM-DD HH24:MI:SSxFF')", got)
 }
 
 func TestBuildSuiteAnalyticsQueryWithLimit(t *testing.T) {
+	// SuiteAnalytics Connect's SQL engine rejects FETCH FIRST; it uses TOP.
 	got := buildSuiteAnalyticsQuery("customer", source.ReadOptions{Limit: 25})
 
-	assert.Equal(t, "SELECT * FROM customer FETCH FIRST 25 ROWS ONLY", got)
+	assert.Equal(t, "SELECT TOP 25 * FROM customer", got)
+}
+
+func TestBuildSuiteAnalyticsQueryWithLimitAndInterval(t *testing.T) {
+	start := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	got := buildSuiteAnalyticsQuery("transaction", source.ReadOptions{
+		IncrementalKey: "lastmodifieddate",
+		IntervalStart:  &start,
+		Limit:          10,
+	})
+
+	// TOP for the limit, interval in WHERE, and no ORDER BY (it crashes the
+	// driver on wide tables and isn't needed for stateless interval loads).
+	assert.Equal(t, "SELECT TOP 10 * FROM transaction WHERE lastmodifieddate >= TO_TIMESTAMP('2026-01-02 03:04:05.000000000', 'YYYY-MM-DD HH24:MI:SSxFF')", got)
 }
 
 func TestUniqueColumnNamesAvoidsGeneratedNameCollisions(t *testing.T) {

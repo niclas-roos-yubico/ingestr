@@ -146,4 +146,6 @@ ingestr ingest \
 
 For plain table names, ingestr runs `SELECT * FROM <source-table>` through SuiteAnalytics Connect. For joins, selected columns, functions, or aliases, use the `query:` source-table form.
 
+SuiteAnalytics Connect runs on the OpenAccess SDK SQL engine, which uses SQL Server-style `SELECT TOP n ...` for row limiting — `FETCH FIRST ... ROWS ONLY` is not supported. ingestr applies `TOP` automatically when you pass `--sql-limit`; in a `query:` write it yourself, e.g. `query:SELECT TOP 5 id, entityid FROM customer`.
+
 SuiteAnalytics Connect schemas vary by account, role, and NetSuite data source, so ingestr infers the destination schema from extracted rows.

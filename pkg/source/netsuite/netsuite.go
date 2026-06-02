@@ -451,7 +451,13 @@ func odbcValue(value string) string {
 }
 
 func buildSuiteAnalyticsQuery(tableName string, opts source.ReadOptions) string {
-	query := fmt.Sprintf("SELECT * FROM %s", strings.TrimSpace(tableName))
+	// SuiteAnalytics Connect runs on the OpenAccess SDK SQL engine, which uses
+	// SQL Server-style TOP for row limiting (FETCH FIRST is rejected).
+	selectClause := "SELECT"
+	if opts.Limit > 0 {
+		selectClause = fmt.Sprintf("SELECT TOP %d", opts.Limit)
+	}
+	query := fmt.Sprintf("%s * FROM %s", selectClause, strings.TrimSpace(tableName))
 
 	var conditions []string
 	if opts.IncrementalKey != "" {
@@ -464,12 +470,13 @@ func buildSuiteAnalyticsQuery(tableName string, opts source.ReadOptions) string 
 	}
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ")
-		query += " ORDER BY " + opts.IncrementalKey + " ASC"
-	}
-	if opts.Limit > 0 {
-		query += fmt.Sprintf(" FETCH FIRST %d ROWS ONLY", opts.Limit)
 	}
 
+	// Intentionally no ORDER BY: ingestr does not checkpoint mid-stream, so the
+	// interval-bounded merge/delete+insert/replace strategies don't depend on
+	// row order. More importantly, ORDER BY over a wide result set (e.g. the
+	// 685-column `transaction` table) crashes the SuiteAnalytics Connect ODBC
+	// driver and forces a slow server-side sort.
 	return query
 }
 
