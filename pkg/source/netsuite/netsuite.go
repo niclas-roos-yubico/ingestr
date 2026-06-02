@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -23,8 +24,9 @@ const (
 )
 
 type NetSuiteSource struct {
-	db         *sql.DB
-	connString string
+	db                 *sql.DB
+	connString         string
+	excludeCLOBColumns bool
 }
 
 type uriConfig struct {
@@ -33,6 +35,10 @@ type uriConfig struct {
 	// connection by tbaConnector).
 	connString string
 	tba        *tbaCredentials
+	// excludeCLOBColumns drops CLOB-typed columns from introspected projections.
+	// The SuiteAnalytics Connect ODBC driver can crash (SIGSEGV) while fetching
+	// CLOB columns from very wide tables; this opt-in avoids that fetch path.
+	excludeCLOBColumns bool
 }
 
 type odbcParam struct {
@@ -73,6 +79,7 @@ func (s *NetSuiteSource) Connect(ctx context.Context, rawURI string) error {
 
 	s.db = db
 	s.connString = cfg.connString
+	s.excludeCLOBColumns = cfg.excludeCLOBColumns
 	config.Debug("[NETSUITE] Connected to SuiteAnalytics Connect over ODBC")
 	return nil
 }
@@ -124,8 +131,100 @@ func (s *NetSuiteSource) GetTable(ctx context.Context, req source.TableRequest) 
 }
 
 func (s *NetSuiteSource) readTable(ctx context.Context, tableName string, opts source.ReadOptions) (<-chan source.RecordBatchResult, error) {
-	query := buildSuiteAnalyticsQuery(tableName, opts)
+	// Project columns explicitly rather than SELECT *. NetSuite tables can be
+	// extremely wide (e.g. `transaction` has ~700 columns), and SELECT * over
+	// such tables crashes the SuiteAnalytics Connect ODBC driver. We discover
+	// the columns from the driver's oa_columns catalog and list them; if that
+	// catalog is unavailable we fall back to SELECT *.
+	columns, err := s.tableColumns(ctx, tableName, opts.ExcludeColumns)
+	if err != nil {
+		config.Debug("[NETSUITE] column introspection failed for %q, falling back to SELECT *: %v", tableName, err)
+		columns = nil
+	}
+
+	query := buildSuiteAnalyticsQuery(tableName, columns, opts)
 	return s.readQuery(ctx, query, opts)
+}
+
+// tableColumns returns the column names of a SuiteAnalytics table from the
+// OpenAccess oa_columns catalog, excluding any names in exclude. The result is
+// sorted for deterministic, layout-stable projections. It returns a nil slice
+// (so the caller falls back to SELECT *) when the table has no catalog entry.
+func (s *NetSuiteSource) tableColumns(ctx context.Context, tableName string, exclude []string) ([]string, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("netsuite source is not connected")
+	}
+
+	lookup := unqualifyTableName(tableName)
+	if lookup == "" {
+		return nil, nil
+	}
+
+	query := fmt.Sprintf("SELECT column_name, type_name FROM oa_columns WHERE table_name = '%s'", strings.ReplaceAll(lookup, "'", "''"))
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read oa_columns for %q: %w", lookup, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	excluded := make(map[string]bool, len(exclude))
+	for _, name := range exclude {
+		excluded[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+
+	type column struct {
+		name   string
+		isCLOB bool
+	}
+	var cols []column
+	skippedCLOB := 0
+	for rows.Next() {
+		var name, typeName string
+		if err := rows.Scan(&name, &typeName); err != nil {
+			return nil, fmt.Errorf("failed to scan oa_columns row: %w", err)
+		}
+		name = strings.TrimSpace(name)
+		if name == "" || excluded[strings.ToLower(name)] {
+			continue
+		}
+		isCLOB := strings.EqualFold(strings.TrimSpace(typeName), "CLOB")
+		if isCLOB && s.excludeCLOBColumns {
+			skippedCLOB++
+			continue
+		}
+		cols = append(cols, column{name: name, isCLOB: isCLOB})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read oa_columns rows: %w", err)
+	}
+
+	// Order long (CLOB) columns last. The ODBC SQLGetData contract requires
+	// long/LOB columns to be retrieved after fixed-width ones; interleaving them
+	// (as SELECT * or an alphabetical projection does) crashes the SuiteAnalytics
+	// Connect driver on wide tables. Within each group, sort for determinism.
+	sort.SliceStable(cols, func(i, j int) bool {
+		if cols[i].isCLOB != cols[j].isCLOB {
+			return !cols[i].isCLOB
+		}
+		return cols[i].name < cols[j].name
+	})
+
+	names := make([]string, len(cols))
+	for i, c := range cols {
+		names[i] = c.name
+	}
+	config.Debug("[NETSUITE] introspected %d columns for %q (skipped %d CLOB)", len(names), lookup, skippedCLOB)
+	return names, nil
+}
+
+// unqualifyTableName strips any schema qualifier and surrounding quotes so the
+// bare table name can be matched against oa_columns.table_name.
+func unqualifyTableName(tableName string) string {
+	name := strings.TrimSpace(tableName)
+	if idx := strings.LastIndex(name, "."); idx >= 0 {
+		name = name[idx+1:]
+	}
+	return strings.Trim(name, "\"")
 }
 
 func (s *NetSuiteSource) ExecuteCustomQuery(ctx context.Context, query string, opts source.ReadOptions) (<-chan source.RecordBatchResult, error) {
@@ -250,9 +349,11 @@ func parseURI(rawURI string) (uriConfig, error) {
 	}
 
 	values := parsed.Query()
+	excludeCLOB := parseBool(firstNonEmpty(values.Get("exclude_clob_columns"), values.Get("skip_clob_columns")))
+
 	connString := firstNonEmpty(values.Get("odbc_connect_string"), values.Get("connection_string"), values.Get("conn_str"))
 	if connString != "" {
-		return uriConfig{connString: connString}, nil
+		return uriConfig{connString: connString, excludeCLOBColumns: excludeCLOB}, nil
 	}
 
 	dsn := values.Get("dsn")
@@ -265,14 +366,14 @@ func parseURI(rawURI string) (uriConfig, error) {
 
 	if dsn != "" {
 		connString := buildDSNConnectionString(parsed, values, dsn, accountID, roleID, tba)
-		return uriConfig{connString: connString, tba: tba}, nil
+		return uriConfig{connString: connString, tba: tba, excludeCLOBColumns: excludeCLOB}, nil
 	}
 
 	connString, err = buildDriverConnectionString(parsed, values, accountID, roleID, tba)
 	if err != nil {
 		return uriConfig{}, err
 	}
-	return uriConfig{connString: connString, tba: tba}, nil
+	return uriConfig{connString: connString, tba: tba, excludeCLOBColumns: excludeCLOB}, nil
 }
 
 // resolveAccountAndRole determines the effective account ID and role ID. Values
@@ -450,14 +551,19 @@ func odbcValue(value string) string {
 	return value
 }
 
-func buildSuiteAnalyticsQuery(tableName string, opts source.ReadOptions) string {
+func buildSuiteAnalyticsQuery(tableName string, columns []string, opts source.ReadOptions) string {
 	// SuiteAnalytics Connect runs on the OpenAccess SDK SQL engine, which uses
 	// SQL Server-style TOP for row limiting (FETCH FIRST is rejected).
+	projection := "*"
+	if len(columns) > 0 {
+		projection = strings.Join(columns, ", ")
+	}
+
 	selectClause := "SELECT"
 	if opts.Limit > 0 {
 		selectClause = fmt.Sprintf("SELECT TOP %d", opts.Limit)
 	}
-	query := fmt.Sprintf("%s * FROM %s", selectClause, strings.TrimSpace(tableName))
+	query := fmt.Sprintf("%s %s FROM %s", selectClause, projection, strings.TrimSpace(tableName))
 
 	var conditions []string
 	if opts.IncrementalKey != "" {

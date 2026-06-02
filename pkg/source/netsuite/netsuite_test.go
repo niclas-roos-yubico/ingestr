@@ -249,7 +249,7 @@ func TestBuildSuiteAnalyticsQuery(t *testing.T) {
 	start := time.Date(2026, 1, 2, 3, 4, 5, 123456789, time.UTC)
 	end := time.Date(2026, 1, 3, 3, 4, 5, 987654321, time.UTC)
 
-	got := buildSuiteAnalyticsQuery("transaction", source.ReadOptions{
+	got := buildSuiteAnalyticsQuery("transaction", nil, source.ReadOptions{
 		IncrementalKey: "lastmodifieddate",
 		IntervalStart:  &start,
 		IntervalEnd:    &end,
@@ -258,16 +258,24 @@ func TestBuildSuiteAnalyticsQuery(t *testing.T) {
 	assert.Equal(t, "SELECT * FROM transaction WHERE lastmodifieddate >= TO_TIMESTAMP('2026-01-02 03:04:05.123456789', 'YYYY-MM-DD HH24:MI:SSxFF') AND lastmodifieddate < TO_TIMESTAMP('2026-01-03 03:04:05.987654321', 'YYYY-MM-DD HH24:MI:SSxFF')", got)
 }
 
+func TestBuildSuiteAnalyticsQueryWithColumns(t *testing.T) {
+	got := buildSuiteAnalyticsQuery("transaction", []string{"id", "trandate", "type"}, source.ReadOptions{})
+	assert.Equal(t, "SELECT id, trandate, type FROM transaction", got)
+
+	gotLimited := buildSuiteAnalyticsQuery("customer", []string{"id", "entityid"}, source.ReadOptions{Limit: 5})
+	assert.Equal(t, "SELECT TOP 5 id, entityid FROM customer", gotLimited)
+}
+
 func TestBuildSuiteAnalyticsQueryWithLimit(t *testing.T) {
 	// SuiteAnalytics Connect's SQL engine rejects FETCH FIRST; it uses TOP.
-	got := buildSuiteAnalyticsQuery("customer", source.ReadOptions{Limit: 25})
+	got := buildSuiteAnalyticsQuery("customer", nil, source.ReadOptions{Limit: 25})
 
 	assert.Equal(t, "SELECT TOP 25 * FROM customer", got)
 }
 
 func TestBuildSuiteAnalyticsQueryWithLimitAndInterval(t *testing.T) {
 	start := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	got := buildSuiteAnalyticsQuery("transaction", source.ReadOptions{
+	got := buildSuiteAnalyticsQuery("transaction", nil, source.ReadOptions{
 		IncrementalKey: "lastmodifieddate",
 		IntervalStart:  &start,
 		Limit:          10,
@@ -328,6 +336,47 @@ func TestNetSuiteSourceReadWithODBCDB(t *testing.T) {
 	assert.Equal(t, int64(1), batches[1].Batch.NumRows())
 	assert.True(t, hasColumn(batches[0], "id"))
 	assert.True(t, hasColumn(batches[0], "name"))
+}
+
+func TestTableColumns(t *testing.T) {
+	newDB := func() *sql.DB {
+		return openNetSuiteTestDB(t, fakeQueryResult{
+			expectedQuery: "SELECT column_name, type_name FROM oa_columns WHERE table_name = 'transaction'",
+			columns:       []string{"column_name", "type_name"},
+			rows: [][]driver.Value{
+				{"trandate", "TIMESTAMP"},
+				{"id", "BIGINT"},
+				{"memo", "VARCHAR2"},
+				{"amount", "DOUBLE"},
+				{"custbody_notes", "CLOB"},
+			},
+		})
+	}
+
+	// Schema qualifier is stripped; non-CLOB columns are sorted first, with CLOB
+	// columns ordered last (the ODBC long-data-last requirement).
+	s := &NetSuiteSource{db: newDB()}
+	cols, err := s.tableColumns(context.Background(), "MyView.transaction", nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"amount", "id", "memo", "trandate", "custbody_notes"}, cols)
+
+	// Excluded columns (case-insensitive) are dropped.
+	cols, err = s.tableColumns(context.Background(), "transaction", []string{"MEMO"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"amount", "id", "trandate", "custbody_notes"}, cols)
+
+	// With excludeCLOBColumns, CLOB-typed columns are skipped entirely.
+	sNoCLOB := &NetSuiteSource{db: newDB(), excludeCLOBColumns: true}
+	cols, err = sNoCLOB.tableColumns(context.Background(), "transaction", nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"amount", "id", "memo", "trandate"}, cols)
+}
+
+func TestUnqualifyTableName(t *testing.T) {
+	assert.Equal(t, "transaction", unqualifyTableName("transaction"))
+	assert.Equal(t, "transaction", unqualifyTableName("schema.transaction"))
+	assert.Equal(t, "transaction", unqualifyTableName(`"transaction"`))
+	assert.Equal(t, "transaction", unqualifyTableName("  transaction  "))
 }
 
 func TestNetSuiteSourceReadQueryError(t *testing.T) {

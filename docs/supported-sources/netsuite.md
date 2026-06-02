@@ -148,4 +148,22 @@ For plain table names, ingestr runs `SELECT * FROM <source-table>` through Suite
 
 SuiteAnalytics Connect runs on the OpenAccess SDK SQL engine, which uses SQL Server-style `SELECT TOP n ...` for row limiting — `FETCH FIRST ... ROWS ONLY` is not supported. ingestr applies `TOP` automatically when you pass `--sql-limit`; in a `query:` write it yourself, e.g. `query:SELECT TOP 5 id, entityid FROM customer`.
 
+For plain table names ingestr does not use `SELECT *`; it introspects the table's columns from the driver's `oa_columns` catalog and projects them explicitly. This avoids `SELECT *` failures on very wide NetSuite tables (e.g. `transaction`, which has hundreds of columns).
+
+### Wide tables and CLOB columns
+
+The ODBC `SQLGetData` contract requires long/`CLOB` columns to be retrieved after all fixed-width columns; interleaving them (as `SELECT *` does) crashes the SuiteAnalytics Connect driver on wide tables. ingestr's introspected projection orders `CLOB` columns **last** automatically, so wide tables such as `transaction` load with all columns — including CLOB custom fields — by default.
+
+If you still want to omit `CLOB` columns entirely (e.g. to reduce volume), add `exclude_clob_columns=true` (alias `skip_clob_columns=true`) to the source URI:
+
+```bash
+ingestr ingest \
+  --source-uri "netsuite://?dsn=${NETSUITE_DSN}&exclude_clob_columns=true&..." \
+  --source-table "transaction" \
+  --dest-uri "duckdb:///netsuite.duckdb" \
+  --dest-table "main.transactions"
+```
+
+When writing a `query:` against a wide table yourself, list `CLOB` columns after the fixed-width ones (and avoid `SELECT *`).
+
 SuiteAnalytics Connect schemas vary by account, role, and NetSuite data source, so ingestr infers the destination schema from extracted rows.
