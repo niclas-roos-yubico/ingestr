@@ -210,11 +210,13 @@ All four objectives passed; verdict: **re-platform is viable.**
 
 ### Findings that feed the build
 
-- **Timestamp unit:** `arrow-jdbc` 17 ships only a **millisecond** TimestampConsumer
-  (no micro/nano variant). The helper must **rescale millis→micros (×1000)**,
-  type-driven to cover both `TimeStampMilliVector` and the tz variant
-  `TimeStampMilliTZVector` (emitted when a Calendar is set), to satisfy the
-  project's microsecond convention.
+- **Timestamp unit (not version-specific):** `arrow-jdbc` ships only
+  `TimestampConsumer` / `TimestampTZConsumer`, both writing **millisecond** vectors
+  (`TimeStampMilliVector` via `Timestamp.getTime()`) — confirmed still true on Arrow
+  Java `main` (ahead of 19.0), so the **latest release does not fix this**. The
+  helper must **rescale millis→micros (×1000)**, type-driven to cover both
+  `TimeStampMilliVector` and the tz variant `TimeStampMilliTZVector` (emitted when a
+  Calendar is set), to satisfy the project's microsecond convention.
 - **JDK 17 flag:** `arrow-memory-netty` needs
   `--add-opens=java.base/java.nio=ALL-UNNAMED` on JDK 17+ (or use
   `arrow-memory-unsafe`). Plan the helper launch accordingly.
@@ -223,8 +225,11 @@ All four objectives passed; verdict: **re-platform is viable.**
 
 ## Open questions (remaining)
 
+- **Arrow Java version:** target the latest release (**19.0**) for the helper, not
+  the spike's 17.0.0. (The millis-timestamp rescale above is still required on 19 —
+  verified against Arrow Java `main`.)
 - Decide `arrow-memory-netty` + `--add-opens` vs `arrow-memory-unsafe` for the
-  shipped helper.
+  shipped helper (re-check the `--add-opens` requirement on Arrow 19 / target JDK).
 - Exact `arrow-jdbc` config for NetSuite **decimals** vs the schema layer (spike
   covered Int64/Double/Utf8/Timestamp; confirm DECIMAL/NUMERIC handling).
 - Pin the supported/tested `NQjc.jar` version range (package ships 8.10.190.0;
