@@ -184,6 +184,13 @@ CLAUDE.local.md
 *.credentials
 test.env
 
+# Proprietary NetSuite drivers (Progress DataDirect EULA — do NOT commit/redistribute)
+netsuite_jdbc_files/
+NetSuiteJDBCDrivers/
+NetSuiteODBCDrivers*/
+NQjc.jar
+*.jar
+
 # Generated registry imports
 internal/registry/imports/imports.gen.go
 

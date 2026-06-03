@@ -52,6 +52,37 @@ wide text arrives as ordinary JDBC `VARCHAR`/`CLOB` → Arrow `Utf8`.
 - **JVM is a documented hard requirement** for the NetSuite source. We do **not**
   bundle a JRE (would break the single-static-binary distribution).
 
+## Verified driver facts (from the supplied package)
+
+The driver package (`netsuite_jdbc_files/`, gitignored — not redistributable) was
+inspected directly:
+
+- **Vendor / EULA:** Progress Software DataDirect (OpenAccess). The EULA prohibits
+  distribute/sublicense (§1.2.5(c)); redistribution requires an explicit grant we
+  do not have. **Confirms the user must supply the jar; we never bundle it.**
+- **Jar / version:** `NQjc.jar`, latest in package `8.10.190.0` (built 2026-05-19).
+- **JDBC driver class:** `com.netsuite.jdbc.openaccess.OpenAccessDriver`
+  (auto-registers via `META-INF/services/java.sql.Driver`).
+- **JDBC URL format** (from the bundled examples):
+  ```
+  jdbc:ns://<host>:<port>;ServerDataSource=NetSuite2.com;encrypted=1;\
+    CustomProperties=(AccountID=<id>;RoleID=<role>);NegotiateSSLClose=false
+  ```
+  host = `<account_id>.connect.api.netsuite.com`, port `1708` — matches the
+  constants already in `netsuite.go`.
+- **Encryption:** `encrypted=1` (TLS); the package ships a `Certificates/` dir, so
+  a truststore may need configuring at runtime.
+- **Java floor:** the driver itself runs on **Java SE 8+** (per its readmes). The
+  effective floor is set by **Apache Arrow Java (11+)**, not the driver — confirm
+  against the exact Arrow version chosen.
+
+> **Auth gap (top risk):** both bundled examples use **password** auth
+> (`Login` + interactive password). **TBA / token-based auth is NOT demonstrated
+> in the package**, yet the existing connector and the `temporal_server` flow
+> default to TBA. How TBA maps onto this JDBC driver's `CustomProperties` (vs the
+> ODBC DSN form) must be resolved in the spike before committing. This is the
+> single biggest unknown.
+
 ## Architecture
 
 ```
@@ -150,16 +181,31 @@ Java helper (netsuite-extractor.jar, pure Java, platform-independent)
 
 ## De-risking spike (do first)
 
-Before the full backend swap, prove end-to-end on the dev Mac:
-`Java(NetSuite JDBC) → arrow-jdbc → Arrow IPC stdout → ingestr reads → DuckDB`,
-one table, natively (no QEMU). Success criteria: rows land with correct types,
-wide-text columns intact, no crash. This validates the `arrow-jdbc` mapping and
-the IPC handoff before committing to removing ODBC.
+Before the full backend swap, prove end-to-end on the dev Mac, natively (no
+QEMU): `Java(NetSuite JDBC) → arrow-jdbc → Arrow IPC stdout → ingestr reads →
+DuckDB`, one table. Ordered objectives (each gates the next):
+
+1. **TBA auth over JDBC works** — resolve how token-based auth maps onto
+   `OpenAccessDriver` `CustomProperties` (the package only shows password auth).
+   This is the gating unknown; if TBA can't be made to work, escalate before
+   building anything.
+2. **TLS/`encrypted=1` connects** — with the shipped `Certificates/` truststore.
+3. **`arrow-jdbc` converts a real table** — types correct, **wide-text/CLOB
+   columns intact** (the columns that crashed under ODBC), microsecond timestamps.
+4. **IPC handoff** — ingestr reads the child's Arrow IPC stream into batches and
+   lands them in DuckDB.
+
+Success = a real `transaction` (or smaller wide table) row sample in DuckDB with
+correct wide-text values and no crash.
 
 ## Open questions
 
-- Minimum JVM version (Arrow Java baseline) and whether to assert it at runtime.
+- **TBA over JDBC** — exact `CustomProperties` (consumer key/secret, token
+  id/secret) for `OpenAccessDriver`. *(Spike objective 1 — highest priority.)*
+- TLS truststore wiring for `encrypted=1` (the bundled `Certificates/` dir).
 - Exact `arrow-jdbc` config for NetSuite decimals/timestamps vs the microsecond
-  convention.
-- `temporal_server` NetSuite worker image change — separate kata issue, cross-repo
-  link to `ingestr#3svm`.
+  convention, and CLOB handling.
+- Pin the `NQjc.jar` version contract (package ships 8.10.190.0) — document the
+  supported/tested driver version range.
+- `temporal_server` NetSuite worker image change (amd64/ODBC base → JRE) —
+  separate kata issue, cross-repo link to `ingestr#3svm`.
