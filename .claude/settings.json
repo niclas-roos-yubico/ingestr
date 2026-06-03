@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "UserPromptExpansion": [
+      {
+        "matcher": "brainstorming|writing-plans|executing-plans|subagent-driven-development",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/kata-first.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
