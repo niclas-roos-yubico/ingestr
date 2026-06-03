@@ -1,8 +1,8 @@
 # NetSuite source over JDBC (JVM-based extractor) — design
 
 - **Date:** 2026-06-03
-- **kata:** epic `ingestr#3svm`, design `ingestr#9ecz`
-- **Status:** proposed (awaiting review)
+- **kata:** epic `ingestr#3svm`, design `ingestr#9ecz`, spike `ingestr#eqkh` (done ✅)
+- **Status:** spike-validated; viable. Awaiting spec review before planning.
 
 ## Summary
 
@@ -76,12 +76,24 @@ inspected directly:
   effective floor is set by **Apache Arrow Java (11+)**, not the driver — confirm
   against the exact Arrow version chosen.
 
-> **Auth gap (top risk):** both bundled examples use **password** auth
-> (`Login` + interactive password). **TBA / token-based auth is NOT demonstrated
-> in the package**, yet the existing connector and the `temporal_server` flow
-> default to TBA. How TBA maps onto this JDBC driver's `CustomProperties` (vs the
-> ODBC DSN form) must be resolved in the spike before committing. This is the
-> single biggest unknown.
+> **Auth: TBA over JDBC — RESOLVED by the spike (`ingestr#eqkh`).** The driver has
+> no TBA concept; `CustomProperties` is forwarded opaquely to the SuiteAnalytics
+> Connect server, so TBA is **identical to the existing ODBC recipe**
+> (`pkg/source/netsuite/tba.go`, branch `netsuite-tba-odbc-improvements`). Recipe:
+> - `UID` = the literal string `"TBA"`.
+> - `PWD` = a single-use **token password**:
+>   `accountID&consumerKey&tokenID&nonce&timestamp&signature&HMAC-SHA256`, where
+>   base = `accountID&consumerKey&tokenID&nonce&timestamp` (each field oauth/
+>   RFC-3986 percent-encoded, `&`-joined), key =
+>   `oauthEncode(consumerSecret)+"&"+oauthEncode(tokenSecret)`, signature =
+>   `Base64(HMAC-SHA256(base, key))`, nonce = 20 random alnum, timestamp = unix
+>   seconds. **Single-use, ~5 min TTL → mint a fresh one per physical connection.**
+> - Connect: `DriverManager.getConnection(url, "TBA", tokenPassword)`. The four
+>   tokens are **never** sent as connection properties — only `AccountID`/`RoleID`
+>   go in `CustomProperties`.
+> - The Java port matched the Go known-answer test vector byte-for-byte and
+>   connected live; real `transaction` rows (incl. wide text >1024 chars) landed
+>   in DuckDB. Password auth (`Login`/password) also remains available.
 
 ## Architecture
 
@@ -179,33 +191,43 @@ Java helper (netsuite-extractor.jar, pure Java, platform-independent)
 - **Integration / spike (manual, gated):** real NetSuite `transaction`
   incremental load on macOS arm64, native (no QEMU), via the JDBC path.
 
-## De-risking spike (do first)
+## De-risking spike — DONE ✅ (`ingestr#eqkh`)
 
-Before the full backend swap, prove end-to-end on the dev Mac, natively (no
-QEMU): `Java(NetSuite JDBC) → arrow-jdbc → Arrow IPC stdout → ingestr reads →
-DuckDB`, one table. Ordered objectives (each gates the next):
+The full path was proven end-to-end on macOS arm64, natively (no QEMU):
+`Java(NetSuite JDBC) → arrow-jdbc 17 → Arrow IPC stdout → Go reader → DuckDB`.
+All four objectives passed; verdict: **re-platform is viable.**
 
-1. **TBA auth over JDBC works** — resolve how token-based auth maps onto
-   `OpenAccessDriver` `CustomProperties` (the package only shows password auth).
-   This is the gating unknown; if TBA can't be made to work, escalate before
-   building anything.
-2. **TLS/`encrypted=1` connects** — with the shipped `Certificates/` truststore.
-3. **`arrow-jdbc` converts a real table** — types correct, **wide-text/CLOB
-   columns intact** (the columns that crashed under ODBC), microsecond timestamps.
-4. **IPC handoff** — ingestr reads the child's Arrow IPC stream into batches and
-   lands them in DuckDB.
+1. **TBA auth** — resolved (see the recipe under "Verified driver facts").
+2. **TLS `encrypted=1`** — connects on the **JVM default truststore**; no custom
+   config needed. The shipped `Certificates/` are just DigiCert Global Root CA +
+   G2 (already public roots) — a fallback, not a requirement.
+3. **`arrow-jdbc` on the crash table (`transaction`)** — wide columns
+   (`LONGNVARCHAR(4000)`, `NVARCHAR(32767)`, etc.) map to Arrow `Utf8`; a 1362-char
+   value (>1024, the ODBC-crash class) came through intact. Crash eliminated by
+   construction.
+4. **IPC handoff** — Go (`arrow-go/v18` + `go-duckdb v2`) read the IPC stream and
+   bulk-loaded via the DuckDB Appender; 25 rows verified byte-faithful.
 
-Success = a real `transaction` (or smaller wide table) row sample in DuckDB with
-correct wide-text values and no crash.
+### Findings that feed the build
 
-## Open questions
+- **Timestamp unit:** `arrow-jdbc` 17 ships only a **millisecond** TimestampConsumer
+  (no micro/nano variant). The helper must **rescale millis→micros (×1000)**,
+  type-driven to cover both `TimeStampMilliVector` and the tz variant
+  `TimeStampMilliTZVector` (emitted when a Calendar is set), to satisfy the
+  project's microsecond convention.
+- **JDK 17 flag:** `arrow-memory-netty` needs
+  `--add-opens=java.base/java.nio=ALL-UNNAMED` on JDK 17+ (or use
+  `arrow-memory-unsafe`). Plan the helper launch accordingly.
+- **Per-connection token:** TBA token password is single-use (~5 min TTL) → mint a
+  fresh one for each physical JDBC connection (matters for pooling/retries).
 
-- **TBA over JDBC** — exact `CustomProperties` (consumer key/secret, token
-  id/secret) for `OpenAccessDriver`. *(Spike objective 1 — highest priority.)*
-- TLS truststore wiring for `encrypted=1` (the bundled `Certificates/` dir).
-- Exact `arrow-jdbc` config for NetSuite decimals/timestamps vs the microsecond
-  convention, and CLOB handling.
-- Pin the `NQjc.jar` version contract (package ships 8.10.190.0) — document the
-  supported/tested driver version range.
+## Open questions (remaining)
+
+- Decide `arrow-memory-netty` + `--add-opens` vs `arrow-memory-unsafe` for the
+  shipped helper.
+- Exact `arrow-jdbc` config for NetSuite **decimals** vs the schema layer (spike
+  covered Int64/Double/Utf8/Timestamp; confirm DECIMAL/NUMERIC handling).
+- Pin the supported/tested `NQjc.jar` version range (package ships 8.10.190.0;
+  spike ran driver OpenAccess 8.1.0.0190).
 - `temporal_server` NetSuite worker image change (amd64/ODBC base → JRE) —
   separate kata issue, cross-repo link to `ingestr#3svm`.
