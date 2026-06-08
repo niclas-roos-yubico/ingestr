@@ -185,6 +185,7 @@ CLAUDE.local.md
 test.env
 
 # Proprietary NetSuite drivers (Progress DataDirect EULA — do NOT commit/redistribute)
+netsuite_drivers/
 netsuite_jdbc_files/
 NetSuiteJDBCDrivers/
 NetSuiteODBCDrivers*/
@@ -204,3 +205,6 @@ benchmarks/results/*.md
 benchmarks/results/*_summary*
 !benchmarks/results/.gitkeep
 .kata.local.toml
+
+# Throwaway spike scratch (NetSuite JDBC de-risking)
+spike/
