@@ -182,3 +182,14 @@ The tool accepts various URI schemes:
 2. Register in `pkg/strategy/strategy.go` init() function
 3. Implement validation for required config (e.g., primary keys for merge)
 4. Execute pattern using IngestionJob (has source, destination, schema, config)
+
+## Issue Tracking with kata
+
+This repo is bound to the kata project **`ingestr`** via `.kata.toml`.
+Always scope kata commands to it with `--project ingestr`.
+
+The full kata workflow — the hierarchy (epic → design/spikes → plan → tasks), the
+specs/epics/exploration lifecycle, the body-as-contract format, the label
+taxonomy, and the reopen / cross-repo conventions — lives in
+[.claude/rules/kata.md](.claude/rules/kata.md), which Claude Code auto-loads. It
+is parameterized with `<project>`; for this repo that is `ingestr`.
